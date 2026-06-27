@@ -19,7 +19,10 @@ from rlinf.scheduler import WorkerGroupFuncResult as Handle
 from rlinf.utils.distributed import ScopedTimer
 from rlinf.utils.logging import get_logger
 from rlinf.utils.metric_logger import MetricLogger
-from rlinf.utils.metric_utils import compute_evaluate_metrics
+from rlinf.utils.metric_utils import (
+    compute_evaluate_metrics,
+    compute_grouped_success_metrics,
+)
 
 if typing.TYPE_CHECKING:
     from omegaconf.dictconfig import DictConfig
@@ -69,12 +72,37 @@ class EmbodiedEvalRunner:
             output_channel=self.env_channel,
         )
         env_results = env_handle.wait()
-        env_decoupled_mode = self.cfg.runner.get("enable_decoupled_mode", False)
-        if not env_decoupled_mode:
-            rollout_handle.wait()
+        rollout_handle.wait()
         eval_metrics_list = [results for results in env_results if results is not None]
         eval_metrics = compute_evaluate_metrics(eval_metrics_list)
+        # Per-task / per-suite breakdown (LIBERO only): the env tags each eval
+        # trajectory with its task_id, which we group here using a static
+        # task_id -> suite map derived from the eval suite name.
+        grouped = compute_grouped_success_metrics(
+            eval_metrics_list, task_to_suite=self._get_task_to_suite()
+        )
+        eval_metrics.update(grouped)
         return eval_metrics
+
+    def _get_task_to_suite(self):
+        """Build (and cache) the task_id -> suite map for the eval benchmark.
+
+        Returns None for non-LIBERO envs, in which case only the overall /
+        per-task breakdown (if any task_id is present) is reported.
+        """
+        if getattr(self, "_task_to_suite", "unset") != "unset":
+            return self._task_to_suite
+
+        self._task_to_suite = None
+        try:
+            eval_cfg = self.cfg.env.eval
+            if str(eval_cfg.get("env_type", "")).lower() == "libero":
+                from rlinf.envs.libero.utils import get_task_suite_map
+
+                self._task_to_suite = get_task_suite_map(eval_cfg.task_suite_name)
+        except Exception as e:  # noqa: BLE001 - reporting must never break eval
+            self.logger.warning(f"Could not build task->suite map: {e}")
+        return self._task_to_suite
 
     def run(self):
         eval_metrics = self.evaluate()
