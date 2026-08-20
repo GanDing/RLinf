@@ -15,6 +15,6 @@
 """Utility modules for the RLinf starVLA wrapper.
 
 This package contains reusable helper modules used by the starVLA adapter,
-including action-space transforms, backbone/data pipelines, state handling,
-and profile inference helpers.
+including accelerator portability helpers, action-space transforms,
+backbone/data pipelines, state handling, and profile inference helpers.
 """

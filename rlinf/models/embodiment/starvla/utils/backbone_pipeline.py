@@ -16,13 +16,13 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from typing import Any, Callable, Optional
 
 import torch
 import torch.nn as nn
 
 from . import vlm_preprocess as vlm_input_utils
+from .accelerator import autocast_ctx
 from .profile import resolve_vlm_interface
 
 _AUXILIARY_MODEL_INPUT_KEYS = {"dino_features"}
@@ -74,11 +74,7 @@ def run_backbone_pipeline(
             f"{sorted(_SUPPORTED_ACTION_HEADS)}, got {action_head_name!r}."
         )
 
-    autocast_ctx = (
-        torch.autocast("cuda", dtype=torch.bfloat16)
-        if torch.cuda.is_available()
-        else nullcontext()
-    )
+    autocast_context = autocast_ctx(torch.bfloat16, device=starvla_model)
 
     if model_inputs is None:
         if examples is None:
@@ -123,7 +119,7 @@ def run_backbone_pipeline(
         hook_handle = embedding_layer.register_forward_hook(input_embedding_hook)
 
     try:
-        with autocast_ctx:
+        with autocast_context:
             vlm_outputs = vlm_interface(
                 **vlm_inputs,
                 use_cache=use_cache,
