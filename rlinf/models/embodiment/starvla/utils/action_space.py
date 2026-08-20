@@ -16,11 +16,108 @@
 
 from __future__ import annotations
 
+import importlib
+import inspect
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any, Optional
 
 import numpy as np
+
+# starVLA moved its model-agnostic action helpers off ``baseframework`` onto
+# ``starVLA.model.tools.FrameworkTools``. Releases up to the ``starVLA-1.2``
+# tag (the revision requirements/install.sh pins) only carry the former, newer
+# revisions only the latter, so both locations are probed in order.
+_ACTION_HELPER_OWNERS = (
+    ("starVLA.model.tools", "FrameworkTools"),
+    ("starVLA.model.framework.base_framework", "baseframework"),
+)
+
+_UNNORMALIZE_ACTIONS_FN: Optional[Callable[..., np.ndarray]] = None
+
+
+def _iter_action_helper_owners():
+    """Yield ``(dotted_name, owner)`` for the starVLA action-helper holders."""
+    for module_name, attr_name in _ACTION_HELPER_OWNERS:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:  # ImportError, or a broken optional dep
+            yield f"{module_name}.{attr_name}", exc
+            continue
+        owner = getattr(module, attr_name, None)
+        yield f"{module_name}.{attr_name}", owner
+
+
+def resolve_unnormalize_actions_fn() -> Callable[..., np.ndarray]:
+    """Return starVLA's ``unnormalize_actions`` helper, whichever version is installed.
+
+    Returns:
+        The static helper mapping normalized actions back to the env action
+        space, resolved once and cached.
+
+    Raises:
+        ModuleNotFoundError: If starVLA is not importable, or exposes the
+            helper at neither the current nor the legacy location.
+    """
+    global _UNNORMALIZE_ACTIONS_FN
+    if _UNNORMALIZE_ACTIONS_FN is not None:
+        return _UNNORMALIZE_ACTIONS_FN
+
+    problems: list[str] = []
+    for name, owner in _iter_action_helper_owners():
+        if isinstance(owner, Exception):
+            problems.append(f"{name}: {type(owner).__name__}: {owner}")
+            continue
+        fn = getattr(owner, "unnormalize_actions", None)
+        if callable(fn):
+            _UNNORMALIZE_ACTIONS_FN = fn
+            return fn
+        problems.append(f"{name}: no 'unnormalize_actions' attribute")
+
+    raise ModuleNotFoundError(
+        "starVLA is required for action unnormalization, but none of its known "
+        "locations provide 'unnormalize_actions'. Checked "
+        + "; ".join(problems)
+        + ". Set cfg.unnorm_key=None to use normalized actions directly."
+    )
+
+
+def _resolve_action_stats_getter(
+    starvla_model: Any,
+) -> Optional[Callable[[Optional[str]], Any]]:
+    """Return a callable mapping an ``unnorm_key`` to a stats block, if any.
+
+    Older starVLA bound ``get_action_stats`` to the model; newer revisions
+    moved it to ``FrameworkTools``, where it takes the stats dict explicitly.
+    """
+    getter = getattr(starvla_model, "get_action_stats", None)
+    if callable(getter):
+        return getter
+
+    norm_stats = getattr(starvla_model, "norm_stats", None)
+    if not isinstance(norm_stats, Mapping):
+        return None
+    for _name, owner in _iter_action_helper_owners():
+        if isinstance(owner, Exception):
+            continue
+        tools_getter = getattr(owner, "get_action_stats", None)
+        if callable(tools_getter) and _takes_stats_first(tools_getter):
+            return lambda key, _getter=tools_getter: _getter(norm_stats, key)
+    return None
+
+
+def _takes_stats_first(getter: Callable[..., Any]) -> bool:
+    """Whether ``getter`` takes the stats dict first, not an unbound ``self``.
+
+    Legacy starVLA declared ``get_action_stats`` as a method reading
+    ``self.norm_stats``; only the ``FrameworkTools`` version is a static helper
+    that accepts the stats dict.
+    """
+    try:
+        parameters = list(inspect.signature(getter).parameters)
+    except (TypeError, ValueError):
+        return False
+    return bool(parameters) and parameters[0] != "self"
 
 
 def resolve_action_norm_stats(
@@ -43,12 +140,13 @@ def resolve_action_norm_stats(
     if isinstance(norm_stats, Mapping) and unnorm_key in norm_stats:
         raw_stats = norm_stats.get(unnorm_key)
     else:
-        getter = getattr(starvla_model, "get_action_stats", None)
-        if not callable(getter):
+        getter = _resolve_action_stats_getter(starvla_model)
+        if getter is None:
             raise RuntimeError(
                 "starVLA action unnormalization requires action norm stats, but the "
-                "loaded model provides neither 'norm_stats' nor 'get_action_stats()'. "
-                f"unnorm_key={unnorm_key!r}."
+                f"loaded model exposes no stats for unnorm_key={unnorm_key!r}: it has "
+                "no usable 'norm_stats' mapping, no 'get_action_stats()' method, and "
+                "starVLA provides no 'get_action_stats' helper."
             )
         try:
             raw_stats = getter(unnorm_key)
@@ -139,9 +237,8 @@ def _gripper_mapping(
 ) -> np.ndarray:
     """Apply LIBERO gripper mapping aligned with starVLA eval pipeline.
 
-    Converts gripper dim (index 6) from 0/1 (as output by
-    ``baseframework.unnormalize_actions``) to +1/-1 as expected by the
-    LIBERO env.
+    Converts gripper dim (index 6) from 0/1 (as output by starVLA's
+    ``unnormalize_actions``) to +1/-1 as expected by the LIBERO env.
 
     The mapping is activated when *policy_setup* resolves to a LIBERO
     platform.  When *policy_setup* is ``None`` we fall back to the
@@ -186,12 +283,7 @@ def unnormalize_actions_for_env(
             "Set cfg.unnorm_key=None to use normalized actions directly."
         )
 
-    try:
-        from starVLA.model.framework.base_framework import baseframework
-    except Exception as exc:
-        raise ModuleNotFoundError(
-            "starVLA is required for action unnormalization but is not importable."
-        ) from exc
+    unnormalize_actions = resolve_unnormalize_actions_fn()
 
     actions = np.asarray(normalized_actions, dtype=np.float32)
     flat = actions.reshape(-1, actions.shape[-1]).astype(np.float32, copy=False)
@@ -200,6 +292,6 @@ def unnormalize_actions_for_env(
         "q01": np.asarray(action_norm_stats["q01"], dtype=np.float32),
         "mask": np.asarray(action_norm_stats["mask"], dtype=bool),
     }
-    env_flat = baseframework.unnormalize_actions(flat, starvla_stats)
+    env_flat = unnormalize_actions(flat, starvla_stats)
     env_actions = np.asarray(env_flat, dtype=np.float32).reshape(actions.shape)
     return _gripper_mapping(env_actions, policy_setup=policy_setup)
