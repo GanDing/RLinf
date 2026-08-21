@@ -36,10 +36,14 @@ from torch.distributions.normal import Normal
 
 logger = logging.getLogger(__name__)
 
-# Autocast is only requested for accelerator backends. CPU autocast rejects
-# float32 as its dtype, and the starVLA paths use fp32 autocast to undo the
-# backbone's bfloat16, so CPU runs simply execute without autocast.
+# Autocast is only requested for accelerator backends; CPU runs simply execute
+# without it.
 _AUTOCAST_DEVICE_TYPES = frozenset({"cuda", "npu", "xpu", "musa", "hpu"})
+
+# The only dtypes a backend can autocast *to*. Asking for float32 does not mean
+# "compute in float32": no backend accepts it, so torch warns on every context
+# entry and falls back to running the block with autocast switched off.
+_AUTOCAST_DTYPES = frozenset({torch.float16, torch.bfloat16})
 
 _AUTOCAST_UNUSABLE_DEVICE_TYPES: set[str] = set()
 
@@ -91,13 +95,18 @@ def autocast_ctx(dtype: torch.dtype, *, device: Any) -> ContextManager:
     """Return an autocast context on ``device``'s backend, else a no-op context.
 
     Args:
-        dtype: Autocast dtype, e.g. ``torch.float32`` or ``torch.bfloat16``.
+        dtype: Autocast dtype. ``torch.float16``/``torch.bfloat16`` cast the
+            block; ``torch.float32`` means "not autocast", matching what
+            upstream starVLA's ``torch.autocast("cuda", dtype=torch.float32)``
+            blocks actually do — they suspend any enclosing autocast so the
+            block runs in the parameters' own precision.
         device: Tensor, module, device, or device string naming the backend to
             autocast on.
 
     Returns:
-        ``torch.autocast`` bound to the resolved device type when that backend
-        supports autocast, otherwise ``contextlib.nullcontext()``.
+        ``torch.autocast`` bound to the resolved device type: casting for a
+        reduced-precision *dtype*, explicitly disabled for any other, and
+        ``contextlib.nullcontext()`` when the backend has no autocast at all.
     """
     device_type = resolve_device_type(device)
     if device_type in _AUTOCAST_UNUSABLE_DEVICE_TYPES or not is_autocast_available(
@@ -105,6 +114,11 @@ def autocast_ctx(dtype: torch.dtype, *, device: Any) -> ContextManager:
     ):
         return nullcontext()
     try:
+        if dtype not in _AUTOCAST_DTYPES:
+            # Passing the dtype through would make torch warn ("the target
+            # dtype is not supported. Disabling autocast") once per entry, on
+            # every rank, and then do exactly this.
+            return torch.autocast(device_type, enabled=False)
         return torch.autocast(device_type, dtype=dtype)
     except (AssertionError, RuntimeError) as error:
         # torch reports the backend as autocast-capable, but its device module

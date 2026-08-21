@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib.util
 import pathlib
+import warnings
 from contextlib import nullcontext
 
 import pytest
@@ -63,9 +64,30 @@ def test_autocast_ctx_is_a_noop_on_cpu():
 def test_autocast_ctx_uses_the_device_backend(monkeypatch):
     recorded = {}
 
-    def fake_autocast(device_type, dtype):
-        recorded["device_type"] = device_type
-        recorded["dtype"] = dtype
+    def fake_autocast(device_type, dtype=None, enabled=True):
+        recorded.update(device_type=device_type, dtype=dtype, enabled=enabled)
+        return nullcontext()
+
+    monkeypatch.setattr(accelerator.torch, "autocast", fake_autocast)
+    monkeypatch.setattr(accelerator, "is_autocast_available", lambda _: True)
+
+    accelerator.autocast_ctx(torch.bfloat16, device="npu:0")
+
+    # Not "cuda": on Ascend a cuda autocast context silently does nothing and
+    # leaves the backbone's bfloat16 in place.
+    assert recorded == {
+        "device_type": "npu",
+        "dtype": torch.bfloat16,
+        "enabled": True,
+    }
+
+
+def test_autocast_ctx_disables_autocast_for_full_precision(monkeypatch):
+    """float32 is not an autocast dtype; torch warns per entry if asked for it."""
+    recorded = {}
+
+    def fake_autocast(device_type, dtype=None, enabled=True):
+        recorded.update(device_type=device_type, dtype=dtype, enabled=enabled)
         return nullcontext()
 
     monkeypatch.setattr(accelerator.torch, "autocast", fake_autocast)
@@ -73,9 +95,18 @@ def test_autocast_ctx_uses_the_device_backend(monkeypatch):
 
     accelerator.autocast_ctx(torch.float32, device="npu:0")
 
-    # Not "cuda": on Ascend a cuda autocast context silently does nothing and
-    # leaves the backbone's bfloat16 in place.
-    assert recorded == {"device_type": "npu", "dtype": torch.float32}
+    assert recorded == {"device_type": "npu", "dtype": None, "enabled": False}
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_autocast_ctx_never_warns_on_a_registered_backend(monkeypatch, dtype):
+    monkeypatch.setattr(accelerator, "is_autocast_available", lambda _: True)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        accelerator.autocast_ctx(dtype, device=torch.zeros(1))
+
+    assert [str(w.message) for w in caught] == []
 
 
 def test_autocast_ctx_skips_backends_without_autocast(monkeypatch):
@@ -94,7 +125,7 @@ def test_autocast_ctx_falls_back_when_the_backend_module_is_incomplete(monkeypat
 
     calls = []
 
-    def failing_autocast(device_type, dtype):
+    def failing_autocast(device_type, dtype=None, enabled=True):
         calls.append(device_type)
         raise AssertionError("the backend has not registered a module")
 
