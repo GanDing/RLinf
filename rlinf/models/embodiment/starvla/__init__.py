@@ -29,7 +29,6 @@ from omegaconf import DictConfig
 from rlinf.utils.logging import get_logger
 
 from .starvla_action_model import StarVLAForRLActionPrediction
-from .utils.npu_patches import apply_starvla_npu_patches
 from .utils.profile import resolve_vlm_interface
 
 
@@ -83,10 +82,6 @@ def get_model(
         ) from e
 
     starvla_model = baseframework.from_pretrained(ckpt_path)
-
-    # Ascend cannot run the backward of the Qwen VL patch-embedding Conv3d.
-    # No-op on every other accelerator.
-    apply_starvla_npu_patches()
 
     # Check early whether the loaded model provides a compatible interface.
     resolve_vlm_interface(starvla_model)
