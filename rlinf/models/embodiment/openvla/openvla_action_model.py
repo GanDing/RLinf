@@ -35,6 +35,7 @@ from prismatic.extern.hf.processing_prismatic import (
 )
 from transformers.generation import (
     GenerateDecoderOnlyOutput,
+    GenerationMixin,
     LogitsProcessor,
     LogitsProcessorList,
     TopKLogitsWarper,
@@ -56,7 +57,33 @@ from rlinf.utils.utils import (
 )
 
 
-class OpenVLAForBatchActionPrediction(OpenVLAForActionPrediction):
+def get_cache_length(past_key_values: Any) -> int:
+    """Return the number of cached tokens held by ``past_key_values``.
+
+    Handles the legacy tuple-of-tuples format, ``transformers`` ``Cache``
+    objects, and ``None``. ``transformers>=4.50`` pre-allocates an *empty*
+    ``Cache`` before the prefill step, so a non-``None`` cache no longer implies
+    that tokens have already been processed.
+    """
+    if past_key_values is None:
+        return 0
+    if hasattr(past_key_values, "get_seq_length"):
+        return past_key_values.get_seq_length() or 0
+    if len(past_key_values) == 0 or past_key_values[0] is None:
+        return 0
+    return past_key_values[0][0].shape[2]
+
+
+class OpenVLAForBatchActionPrediction(OpenVLAForActionPrediction, GenerationMixin):
+    """Batched OpenVLA action prediction.
+
+    ``GenerationMixin`` is inherited explicitly: ``transformers>=4.50`` removed
+    it from ``PreTrainedModel``, so upstream ``PrismaticForConditionalGeneration``
+    (which only subclasses ``PreTrainedModel``) no longer exposes ``generate()``.
+    Listing the mixin here keeps ``generate()`` available on new and old
+    ``transformers`` releases alike.
+    """
+
     # === Core Prismatic VLM `forward()` Logic ===
     def forward(
         self,
@@ -94,6 +121,11 @@ class OpenVLAForBatchActionPrediction(OpenVLAForActionPrediction):
 
         # Respect `use_cache` only if not training (even if `gradient_checkpointing` is off)
         use_cache = use_cache and not self.training
+
+        # `transformers>=4.50` hands `generate()` an empty `Cache` on the prefill
+        # step; the prefill branches below expect `None` there.
+        if get_cache_length(past_key_values) == 0:
+            past_key_values = None
 
         # Instantiate Placeholder for Projector Features
         projected_patch_embeddings = None
@@ -304,10 +336,14 @@ class OpenVLAForBatchActionPrediction(OpenVLAForActionPrediction):
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs: str,
     ) -> dict[str, torch.Tensor]:
-        """Borrowed from `LlamaForCausalLM` and simplified for batch size = 1; mirrors original PrismaticVLM logic."""
-        # Handle `past_key_values` (cache) =>> assume `input_ids` just has unprocessed tokens
-        if past_key_values is not None:
+        """Borrowed from `LlamaForCausalLM`; mirrors original PrismaticVLM logic but supports batched generation."""
+        # Handle `past_key_values` (cache) =>> assume `input_ids` just has unprocessed tokens.
+        # Test the cached length rather than `is not None`: `transformers>=4.50`
+        # pre-allocates an empty `Cache` before the prefill step.
+        if get_cache_length(past_key_values) > 0:
             input_ids = input_ids[:, -1:]
+        else:
+            past_key_values = None
 
         # If `input_embeds` are passed, we only want to use them in the 1st generation step
         if inputs_embeds is not None and past_key_values is None:
