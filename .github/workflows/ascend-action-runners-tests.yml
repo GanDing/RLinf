@@ -1,0 +1,91 @@
+name: Ascend Action Runners Tests
+
+on:
+  pull_request:
+    branches:
+      - "release/v[0-9]*.[0-9]*"
+      - main
+    types: [synchronize, labeled]
+  push:
+  workflow_dispatch:
+
+# Steps run inside a container, where the runner falls back to `sh` unless a
+# shell is set explicitly. `source .venv/bin/activate` needs bash.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  job_0:
+    runs-on: linux-aarch64-a2-1
+    container:
+      image: ascendai/cann:latest
+
+    steps:
+      - name: Show NPU info
+        run: |
+          npu-smi info
+
+  embodied-openvlaoft-libero-ascend-test:
+    runs-on: linux-aarch64-a2-4
+    container:
+      image: ascendai/cann:latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Create Ascend embodied environment
+        run: |
+          unset UV_DEFAULT_INDEX
+          export UV_PATH=/workspace/dataset/.uv
+          export UV_CACHE_DIR=/workspace/dataset/.uv_cache
+          export UV_PYTHON_INSTALL_DIR=/workspace/dataset/.uv_python
+          bash requirements/install.sh --platform ascend embodied --model openvla-oft --env libero
+
+      - name: Libero-Goal GRPO test
+        timeout-minutes: 20
+        run: |
+          unset PYTHONPATH
+          export REPO_PATH=$(pwd)
+          source .venv/bin/activate
+          bash tests/e2e_tests/embodied/run.sh libero_goal_grpo_openvlaoft osmesa
+          ray stop
+
+      - name: Clean up
+        run: |
+          rm -rf .venv
+          uv cache prune
+  
+  embodied-gr00t-libero-ascend-test:
+    runs-on: linux-aarch64-a2-4
+    container:
+      image: ascendai/cann:latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Create Ascend embodied environment
+        run: |
+          unset UV_DEFAULT_INDEX
+          export UV_PATH=/workspace/dataset/.uv
+          export UV_CACHE_DIR=/workspace/dataset/.uv_cache
+          export UV_PYTHON_INSTALL_DIR=/workspace/dataset/.uv_python
+          export GR00T_PATH=/workspace/dataset/Isaac-GR00T/
+          export DECORD_PATH=/workspace/dataset/decord
+          bash requirements/install.sh --platform ascend embodied --model gr00t --env libero
+
+      - name: Libero-Spatial PPO test
+        timeout-minutes: 20
+        run: |
+          unset PYTHONPATH
+          export REPO_PATH=$(pwd)
+          source .venv/bin/activate
+          bash tests/e2e_tests/embodied/run.sh libero_spatial_ppo_gr00t osmesa
+          ray stop
+
+      - name: Clean up
+        run: |
+          rm -rf .venv
+          uv cache prune
