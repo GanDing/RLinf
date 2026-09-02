@@ -1991,14 +1991,25 @@ class CollectiveGroup:
         )
         tensor_handles = self._tensor_to_object(handles_tensor, handles_tensor_size)
 
+        # Local import: rlinf.scheduler is a lower layer than rlinf.utils, and
+        # these probes are no-ops unless RLINF_MEM_DEBUG is set.
+        from rlinf.utils.mem_debug import log_tensor_sizes, mem_snapshot
+
+        mem_snapshot("recv_tensor_list_via_ipc/before_rebuild")
         remote_tensors = [
             rebuild_func(*rebuild_args)
             for (rebuild_func, rebuild_args) in tensor_handles
         ]
+        log_tensor_sizes(
+            "recv_tensor_list_via_ipc/payload",
+            ((f"t{i}", t) for i, t in enumerate(remote_tensors)),
+        )
+        mem_snapshot("recv_tensor_list_via_ipc/after_rebuild")
         tensors = [
             tensor.clone().detach().to(Worker.torch_platform.current_device())
             for tensor in remote_tensors
         ]
+        mem_snapshot("recv_tensor_list_via_ipc/after_clone")
 
         Worker.torch_platform.current_stream().synchronize()
         remote_tensors.clear()

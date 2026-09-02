@@ -31,6 +31,7 @@ from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.distributed import (
     all_reduce_dict,
 )
+from rlinf.utils.mem_debug import mem_snapshot
 from rlinf.utils.metric_utils import (
     CRITIC_EXPLAINED_VARIANCE_KEY,
     append_to_dict,
@@ -130,14 +131,17 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
     @Worker.timer("actor/sync_model_to_rollout")
     async def sync_model_to_rollout(self) -> None:
+        mem_snapshot("sync_model_to_rollout/enter", reset_peak=True)
         if self.enable_offload:
             if not self.is_optimizer_offloaded:
                 self.offload_optimizer()
 
             if self.is_weight_offloaded:
                 self.load_param_and_grad(self.device, False)
+        mem_snapshot("sync_model_to_rollout/after_onload")
 
         state_dict = self.get_rollout_state_dict()
+        mem_snapshot("sync_model_to_rollout/after_state_dict")
 
         async def send_func(data):
             if not self._is_weight_sender:
@@ -176,12 +180,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             else self.version
         )
         await self.weight_syncer.sync(state_dict, send_func, version=version)
+        mem_snapshot("sync_model_to_rollout/after_sync")
 
         if self.enable_offload:
             assert not self.is_weight_offloaded, (
                 "weight should be offloaded in sync_model_to_rollout"
             )
             self.offload_param_and_grad(True)
+        mem_snapshot("sync_model_to_rollout/exit")
 
     @Worker.timer("actor/recv_traj")
     async def recv_rollout_trajectories(self, input_channel: Channel) -> None:
@@ -192,6 +198,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             input_channel: The input channel to read from.
         """
         clear_memory(sync=False)
+        mem_snapshot("recv_rollout_trajectories/after_clear")
 
         send_num = self._component_placement.get_world_size("env") * self.stage_num
         recv_num = self._component_placement.get_world_size("actor")
@@ -573,6 +580,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
         clear_memory()
+        mem_snapshot("run_training/after_clear")
         explained_variance_stats = pop_critic_explained_variance_stats(metrics)
         mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
         mean_metric_dict = all_reduce_dict(

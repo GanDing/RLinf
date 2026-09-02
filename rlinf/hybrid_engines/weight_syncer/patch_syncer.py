@@ -21,6 +21,13 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from rlinf.scheduler import Worker
+from rlinf.utils.logging import get_logger
+from rlinf.utils.mem_debug import (
+    log_tensor_sizes,
+    mem_debug_enabled,
+    mem_snapshot,
+    tensor_bytes,
+)
 from rlinf.utils.utils import (
     materialize_tensor,
     normalize_device,
@@ -54,6 +61,37 @@ def downscale_nonnegative_indices(tensor: torch.Tensor) -> torch.Tensor:
     if max_value <= torch.iinfo(torch.int32).max:
         return tensor.to(torch.int32)
     return tensor.to(torch.int64)
+
+
+def _log_patch_chunk_stats(
+    num_synced_params: int,
+    row_chunks: list[torch.Tensor],
+    col_chunks: list[torch.Tensor],
+    value_byte_chunks: list[torch.Tensor],
+) -> None:
+    """Report the COO accumulators held on the accelerator before ``torch.cat``.
+
+    ``rows``/``cols`` leave ``nonzero()`` as ``int64`` and are only narrowed by
+    ``downscale_nonnegative_indices`` after the concatenation, so this is the
+    build-up a large patch pays for. No-op unless ``RLINF_MEM_DEBUG`` is enabled.
+    """
+    if not mem_debug_enabled():
+        return
+
+    rows_bytes = sum(tensor_bytes(t) for t in row_chunks)
+    cols_bytes = sum(tensor_bytes(t) for t in col_chunks)
+    values_bytes = sum(tensor_bytes(t) for t in value_byte_chunks)
+    nnz = sum(t.numel() for t in value_byte_chunks)
+    mib = 1024.0 * 1024.0
+    get_logger().info(
+        f"[mem] create_patch/before_cat synced_params={num_synced_params} "
+        f"chunks={len(row_chunks)} value_bytes={nnz} "
+        f"rows={rows_bytes / mib:.1f}MiB[{row_chunks[0].dtype}] "
+        f"cols={cols_bytes / mib:.1f}MiB[{col_chunks[0].dtype}] "
+        f"values={values_bytes / mib:.1f}MiB "
+        f"total={(rows_bytes + cols_bytes + values_bytes) / mib:.1f}MiB"
+    )
+    mem_snapshot("create_patch/before_cat")
 
 
 def as_coo_2d_view(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Size]:
@@ -463,6 +501,7 @@ class CPUSnapshotPatchBuilder(PatchBuilder):
         if set(state_dict.keys()) != set(self.ordered_keys):
             raise ValueError("State dict keys do not match snapshot keys")
 
+        mem_snapshot("create_patch/enter", reset_peak=True)
         ordinals: list[torch.Tensor] = []
         nnz_per_tensor: list[torch.Tensor] = []
         row_chunks: list[torch.Tensor] = []
@@ -551,6 +590,12 @@ class CPUSnapshotPatchBuilder(PatchBuilder):
             )
 
         if row_chunks:
+            _log_patch_chunk_stats(
+                len(self.param_names_need_sync),
+                row_chunks,
+                col_chunks,
+                value_byte_chunks,
+            )
             rows_tensor = downscale_nonnegative_indices(torch.cat(row_chunks, dim=0))
             cols_tensor = downscale_nonnegative_indices(torch.cat(col_chunks, dim=0))
             patch = WeightPatch(
@@ -677,6 +722,7 @@ class GPUSnapshotPatchBuilder(PatchBuilder):
         col_chunks: list[torch.Tensor] = []
         value_byte_chunks: list[torch.Tensor] = []
         patch_device: torch.device | None = None
+        mem_snapshot("create_patch/enter", reset_peak=True)
 
         for param_name in self.param_names_need_sync:
             ordinal = self.param_names_need_sync_ordinals[param_name]
@@ -750,6 +796,12 @@ class GPUSnapshotPatchBuilder(PatchBuilder):
             )
 
         if row_chunks:
+            _log_patch_chunk_stats(
+                len(self.param_names_need_sync),
+                row_chunks,
+                col_chunks,
+                value_byte_chunks,
+            )
             rows_tensor = downscale_nonnegative_indices(torch.cat(row_chunks, dim=0))
             cols_tensor = downscale_nonnegative_indices(torch.cat(col_chunks, dim=0))
             return WeightPatch(
@@ -1031,6 +1083,18 @@ class PatchWeightSyncer(WeightSyncer):
         version: int | torch.Tensor,
     ) -> None:
         patch = self.create_patch(state_dict, version)
+        mem_snapshot("sync/after_create_patch")
+        if isinstance(patch, WeightPatch):
+            log_tensor_sizes(
+                "sync/patch",
+                (
+                    ("ordinals", patch.ordinals),
+                    ("nnz_per_tensor", patch.nnz_per_tensor),
+                    ("rows", patch.rows),
+                    ("cols", patch.cols),
+                    ("values", patch.values),
+                ),
+            )
         transport_patch = patch.to(
             device=self.transport_device,
             non_blocking=self.transport_device.type != "cpu",
@@ -1039,6 +1103,7 @@ class PatchWeightSyncer(WeightSyncer):
             await send(transport_patch)
         else:
             await send(self.compressor.compress(transport_patch))
+        mem_snapshot("sync/after_send")
 
     @torch.no_grad()
     async def apply(self, model: torch.nn.Module, recv: RecvFn) -> int:
