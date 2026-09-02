@@ -19,6 +19,31 @@ import pytest
 import torch
 
 from rlinf.scheduler import Cluster, PackedPlacementStrategy, Worker
+from rlinf.scheduler.collective import CollectiveGroup
+
+# Distinct dtype/shape per entry, so a mapping released before its copy landed
+# shows up as wrong data rather than a merely plausible tensor.
+MULTI_WINDOW_SPECS = [
+    ((512, 8), torch.float32),
+    ((256, 16), torch.bfloat16),
+    ((1024, 2), torch.int64),
+    ((640, 4), torch.uint8),
+    ((128, 32), torch.float32),
+    ((300, 7), torch.int32),
+]
+# Small enough that the payload above spans several release windows.
+MULTI_WINDOW_RELEASE_BYTES = 4096
+
+
+def build_multi_window_tensors(device):
+    """Build the multi-window payload, deterministic and distinct per entry."""
+    tensors = []
+    for idx, (shape, dtype) in enumerate(MULTI_WINDOW_SPECS):
+        numel = shape[0] * shape[1]
+        values = (torch.arange(numel, dtype=torch.int64) + idx * 7) % 251
+        tensors.append(values.reshape(shape).to(device=device, dtype=dtype))
+    return tensors
+
 
 SENDER_GROUP_NAME = "sender_ipc_worker_group"
 RECEIVER_GROUP_NAME = "receiver_ipc_worker_group"
@@ -99,6 +124,18 @@ class SenderWorker(Worker):
                 self.async_wait(work)
         return True
 
+    def send_multi_window_tensor_list(self, async_op, group_name):
+        """Sends a payload large enough to span several IPC release windows."""
+        tensors = build_multi_window_tensors(get_device())
+        is_async = async_op > 0
+        work = self.send(tensors, group_name, dst_rank=self._rank, async_op=is_async)
+        if is_async and work:
+            if async_op == 1:
+                work.wait()
+            else:
+                self.async_wait(work)
+        return True
+
     def send_mixed_gpu_tensor_list(self, async_op, group_name):
         """Sends a list of tensors from different accelerators."""
         num_gpus = accelerator_device_count()
@@ -157,6 +194,19 @@ class ReceiverWorker(Worker):
             else:
                 return self.async_wait(work)
         return work
+
+    def recv_multi_window_tensor_list(self, async_op, group_name, release_bytes):
+        """Receives a tensor list with the IPC release window shrunk.
+
+        Forcing several windows exercises the mid-loop release in
+        ``_recv_tensor_list_via_ipc`` without needing a large payload.
+        """
+        original = CollectiveGroup.IPC_RECV_RELEASE_BYTES
+        CollectiveGroup.IPC_RECV_RELEASE_BYTES = release_bytes
+        try:
+            return self.recv_tensor_list(async_op, group_name)
+        finally:
+            CollectiveGroup.IPC_RECV_RELEASE_BYTES = original
 
 
 # --- Pytest Setup ---
@@ -266,6 +316,35 @@ class TestSameDeviceCommunication:
         for i, tensor in enumerate(results):
             expected = torch.ones(2, 2) * i  # Sender rank 0 + i
             assert torch.equal(tensor.cpu(), expected)
+
+    @pytest.mark.parametrize("async_op", [0, 1, 2], ids=["sync", "async", "asyncio"])
+    def test_multi_window_tensor_list_on_single_shared_gpu(
+        self, single_shared_gpu_groups, async_op
+    ):
+        """Tensor-list IPC recv must be exact when mappings are released mid-loop.
+
+        ``_recv_tensor_list_via_ipc`` releases IPC mappings once a byte budget of
+        them is open, instead of holding the whole payload mapped. ``clone()``
+        only enqueues the copy, so a release that runs before the copy lands would
+        read freed memory. Shrinking the window makes several releases happen
+        inside one transfer.
+        """
+        results = self._run_test(
+            single_shared_gpu_groups,
+            "send_multi_window_tensor_list",
+            "recv_multi_window_tensor_list",
+            (async_op, RECEIVER_GROUP_NAME),
+            (async_op, SENDER_GROUP_NAME, MULTI_WINDOW_RELEASE_BYTES),
+        )
+        results = results[0]
+        assert isinstance(results, list)
+        assert len(results) == len(MULTI_WINDOW_SPECS)
+
+        expected_tensors = build_multi_window_tensors("cpu")
+        for received, expected in zip(results, expected_tensors):
+            assert received.shape == expected.shape
+            assert received.dtype == expected.dtype
+            assert torch.equal(received.cpu(), expected)
 
     @pytest.mark.parametrize("async_op", [0, 1, 2], ids=["sync", "async", "asyncio"])
     def test_single_tensor_on_multi_shared_gpu(self, multi_shared_gpu_groups, async_op):

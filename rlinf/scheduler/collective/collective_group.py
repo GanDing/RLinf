@@ -209,6 +209,17 @@ class CollectiveGroup:
     OBJECT: int = 3
     DATACLASS_WITH_TENSORS: int = 4
     POOL_SIZE: int = 1
+    IPC_RECV_RELEASE_BYTES: int = 256 * 1024 * 1024
+    """Byte budget of IPC mappings the tensor-list receive keeps open at once.
+
+    ``_recv_tensor_list_via_ipc`` copies out of mappings into local memory, so
+    holding the whole payload mapped would make the receiving device carry the
+    payload twice -- once mapped from the sender, once cloned. That is paid on a
+    single device whenever sender and receiver share one (the collocated
+    actor/rollout weight sync). Releasing in windows bounds the mapped side while
+    keeping the number of stream synchronizations proportional to payload size
+    rather than to tensor count.
+    """
 
     def __init__(
         self,
@@ -1995,24 +2006,44 @@ class CollectiveGroup:
         # these probes are no-ops unless RLINF_MEM_DEBUG is set.
         from rlinf.utils.mem_debug import log_tensor_sizes, mem_snapshot
 
-        mem_snapshot("recv_tensor_list_via_ipc/before_rebuild")
-        remote_tensors = [
-            rebuild_func(*rebuild_args)
-            for (rebuild_func, rebuild_args) in tensor_handles
-        ]
+        # Peak across the loop is the interesting number now that mappings are
+        # released in windows: there is no longer a point where the whole
+        # payload is mapped but nothing is cloned.
+        mem_snapshot("recv_tensor_list_via_ipc/before_rebuild", reset_peak=True)
+        current_device = Worker.torch_platform.current_device()
+        tensors: list[torch.Tensor] = []
+        # Mappings whose clone may still be in flight on the stream. They are
+        # released in windows rather than all at the end, so the receiving device
+        # never has to hold the whole payload mapped and cloned at once.
+        pending_remote_tensors: list[torch.Tensor] = []
+        pending_bytes = 0
+        try:
+            for rebuild_func, rebuild_args in tensor_handles:
+                remote_tensor = rebuild_func(*rebuild_args)
+                pending_remote_tensors.append(remote_tensor)
+                pending_bytes += remote_tensor.numel() * remote_tensor.element_size()
+                tensors.append(remote_tensor.clone().detach().to(current_device))
+                if pending_bytes >= CollectiveGroup.IPC_RECV_RELEASE_BYTES:
+                    # clone() only enqueues the copy, so it has to complete before
+                    # the mapping goes away -- same ordering as
+                    # _recv_single_tensor_via_ipc.
+                    Worker.torch_platform.current_stream().synchronize()
+                    pending_remote_tensors.clear()
+                    pending_bytes = 0
+            Worker.torch_platform.current_stream().synchronize()
+        finally:
+            # Drop the mappings even if a rebuild or clone raised (an OOM here is
+            # exactly the case that must not leak them). The loop variable outlives
+            # the loop in Python, so it has to be dropped too or the last mapping
+            # stays open across the ipc_collect() below.
+            pending_remote_tensors.clear()
+            remote_tensor = None
         log_tensor_sizes(
             "recv_tensor_list_via_ipc/payload",
-            ((f"t{i}", t) for i, t in enumerate(remote_tensors)),
+            ((f"t{i}", t) for i, t in enumerate(tensors)),
         )
-        mem_snapshot("recv_tensor_list_via_ipc/after_rebuild")
-        tensors = [
-            tensor.clone().detach().to(Worker.torch_platform.current_device())
-            for tensor in remote_tensors
-        ]
         mem_snapshot("recv_tensor_list_via_ipc/after_clone")
 
-        Worker.torch_platform.current_stream().synchronize()
-        remote_tensors.clear()
         zero_tensor = torch.tensor(0, dtype=torch.long, device="cpu")
         self._recv(zero_tensor, CollectiveGroup.CPU, comm_id)
         Worker.torch_platform.ipc_collect()

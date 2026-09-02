@@ -36,6 +36,7 @@ from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
 from rlinf.utils.obs_compression import decompress_obs, infer_obs_batch_size
 from rlinf.utils.placement import HybridComponentPlacement
+from rlinf.utils.utils import clear_memory
 
 
 class MultiStepRolloutWorker(Worker):
@@ -883,7 +884,9 @@ class MultiStepRolloutWorker(Worker):
             self.rlt_feature_model.to("cpu")
         if self.expert_model is not None:
             self.expert_model.to("cpu")
-        self.torch_platform.empty_cache()
+        # Collect before dropping the cache: emptying it without a gc pass first
+        # leaves anything still referenced (e.g. released graph buffers) resident.
+        clear_memory()
 
     def reload_model(self):
         self.hf_model.to(self.device)
